@@ -1,6 +1,8 @@
-# Task assets
+# Task Assets
 
-Phase-0 task uses a procedural cube body in robot MJCF files.
+Phase-0 reorientation task assets live here.
 
-This folder is reserved for future shared assets (e.g., textures, alternative cubes,
-fixtures). It is kept to preserve a stable project layout.
+- `cube.xml`: free-body cube used by both Allegro and xHand runs.
+
+The robot is loaded from `src/dexplay/envs/robots/<robot>/model/*.xml`, and the task
+attaches this shared cube entity so robot switching remains a config flag.

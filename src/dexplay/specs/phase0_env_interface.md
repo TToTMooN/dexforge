@@ -1,41 +1,28 @@
 # Phase-0 Environment Interface (DexPlay)
 
-This document defines the env contract used by training and evaluation.
+This document defines the Phase-0 task contract for `allegro_xhand_reorient`.
 
-## Single Env API
+## Core Env
 
-`ReorientEnv.reset()` returns:
-- `obs: np.ndarray[float32]` shape `(2 * n_joints + 13,)`
-- `info: dict` containing `target_quat`
+Primary env class: `ReorientMjlabEnv` (`mjlab` manager-based RL env).
 
-`ReorientEnv.step(action)` returns:
+Step API:
+- `obs: dict[str, torch.Tensor]`
+- `reward: torch.Tensor[num_envs]`
+- `terminated: torch.Tensor[num_envs]`
+- `truncated: torch.Tensor[num_envs]`
+- `extras: dict`
+
+`ReorientEnv` provides a single-env numpy adapter and returns:
 - `obs: np.ndarray[float32]`
 - `reward: float`
 - `terminated: bool`
 - `truncated: bool`
-- `info: dict`
-
-When `terminated or truncated` is true, `info` includes:
-- `termination_reason` in `{SUCCESS, DROP, OOB, TIMEOUT, NAN}`
-- `episode_return`
-- `episode_length`
-- `final_orientation_error`
-- `mean_action_norm`
-- `max_action_norm`
-
-## Vector Env API (rsl_rl)
-
-`ReorientVecEnv` implements `rsl_rl.env.VecEnv`:
-- `get_observations() -> TensorDict` with groups `policy` and `critic`
-- `step(actions) -> (obs, rewards, dones, extras)`
-
-`extras` includes:
-- `time_outs: torch.Tensor[num_envs]`
-- optional `log` dict with aggregate episode metrics
+- `info: dict` with `termination_reason` on done
 
 ## Observation Layout
 
-For a robot with `n_joints`:
+Per environment (`policy` and `critic` groups use this same flat vector):
 1. joint positions `(n_joints)`
 2. joint velocities `(n_joints)`
 3. cube position `(3)`
@@ -43,9 +30,22 @@ For a robot with `n_joints`:
 5. cube linear velocity `(3)`
 6. cube angular velocity `(3)`
 
+Total dimension: `2 * n_joints + 13`.
+
 ## Action Layout
 
-- `action` shape `(n_joints,)`
-- interpreted as joint target deltas
-- converted to absolute targets
-- clamped and tracked with conservative PD + torque limits
+- Action shape: `(n_joints,)`
+- Semantics: joint position target deltas
+- Internal control: `JointPositionAction` with conservative actuator limits + clamps
+
+## Termination Reasons
+
+Logged termination taxonomy:
+- `SUCCESS`
+- `DROP`
+- `OOB`
+- `TIMEOUT`
+- `NAN`
+
+`ReorientVecEnv` maps manager termination terms to these labels and writes per-episode JSONL
+records in train/eval runs.

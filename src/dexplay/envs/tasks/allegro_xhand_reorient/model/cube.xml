@@ -1,0 +1,24 @@
+<mujoco model="dexplay_phase0_cube">
+  <compiler angle="radian"/>
+  <default>
+    <geom condim="6" friction="1.0 0.05 0.002" solref="0.005 1"/>
+  </default>
+
+  <worldbody>
+    <body name="cube" pos="0 0 0.13">
+      <freejoint name="cube_free"/>
+      <geom
+        name="cube_geom"
+        type="box"
+        size="0.015 0.015 0.015"
+        mass="0.035"
+        rgba="0.24 0.52 0.90 1"
+      />
+      <site name="cube_center" pos="0 0 0" size="0.003" rgba="0 0.8 1 1"/>
+    </body>
+  </worldbody>
+
+  <keyframe>
+    <key name="default" qpos="0 0 0.13 1 0 0 0"/>
+  </keyframe>
+</mujoco>

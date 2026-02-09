@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import argparse
 import os
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import torch
+import tyro
 from rsl_rl.runners import OnPolicyRunner
 
 from dexplay.envs.robots import get_robot_cfg
@@ -18,6 +20,17 @@ from dexplay.rl.ppo_config import build_ppo_train_cfg
 from dexplay.utils.logging import write_jsonl
 from dexplay.utils.paths import eval_log_path, eval_report_path
 from dexplay.utils.seeding import seed_everything
+
+
+@dataclass
+class EvalArgs:
+    run_name: str
+    robot: Literal["allegro", "xhand"]
+    checkpoint_path: Path
+    episodes: int = 50
+    seed: int = 0
+    device: Literal["cuda", "cpu"] = "cuda"
+    debug: bool = False
 
 
 def _resolve_device(device_arg: str) -> str:
@@ -33,7 +46,6 @@ def evaluate_checkpoint(
     episodes: int,
     seed: int,
     device: str,
-    backend: str,
     debug: bool = False,
 ) -> dict[str, float]:
     if not checkpoint_path.exists():
@@ -55,7 +67,7 @@ def evaluate_checkpoint(
         seed=seed,
         run_name=run_name,
         split="eval",
-        backend=backend,
+        device=device,
         debug=debug,
     )
 
@@ -108,23 +120,8 @@ def evaluate_checkpoint(
     return summary
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Deterministic eval for dexplay Phase-0")
-    parser.add_argument("--run_name", type=str, required=True)
-    parser.add_argument("--robot", type=str, choices=["allegro", "xhand"], required=True)
-    parser.add_argument("--checkpoint_path", type=Path, required=True)
-    parser.add_argument("--episodes", type=int, default=50)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--device", type=str, choices=["cuda", "cpu"], default="cuda")
-    parser.add_argument("--backend", type=str, choices=["auto", "mjlab", "mujoco"], default="auto")
-    parser.add_argument("--debug", action="store_true")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
+def main(args: EvalArgs) -> None:
     resolved_device = _resolve_device(args.device)
-
     if args.device == "cuda" and resolved_device == "cpu":
         print("CUDA requested but unavailable. Falling back to CPU for eval.")
 
@@ -135,10 +132,9 @@ def main() -> None:
         episodes=max(1, args.episodes),
         seed=args.seed,
         device=resolved_device,
-        backend=args.backend,
         debug=args.debug,
     )
 
 
 if __name__ == "__main__":
-    main()
+    main(tyro.cli(EvalArgs))

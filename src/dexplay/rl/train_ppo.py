@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-import argparse
 import json
 import math
 import os
 import shutil
+from dataclasses import asdict, dataclass
+from typing import Literal
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 import torch
+import tyro
 from rsl_rl.runners import OnPolicyRunner
 
 from dexplay.envs.robots import get_robot_cfg
@@ -21,34 +23,32 @@ from dexplay.utils.paths import checkpoint_dir, eval_log_path, run_dir, train_lo
 from dexplay.utils.seeding import seed_everything
 
 
+@dataclass
+class TrainArgs:
+    run_name: str = "demo_allegro"
+    robot: Literal["allegro", "xhand"] = "allegro"
+    seed: int = 0
+    total_timesteps: int = 200_000
+    num_envs: int | None = None
+    device: Literal["cuda", "cpu"] = "cuda"
+    save_every: int = 50_000
+    eval_episodes: int = 50
+    debug: bool = False
+
+
 def _resolve_device(device_arg: str) -> str:
     if device_arg == "cuda" and torch.cuda.is_available():
         return "cuda"
     return "cpu"
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train PPO on dexplay Phase-0")
-    parser.add_argument("--run_name", type=str, default="demo_allegro")
-    parser.add_argument("--robot", type=str, choices=["allegro", "xhand"], required=True)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--total_timesteps", type=int, default=200000)
-    parser.add_argument("--num_envs", type=int, default=None)
-    parser.add_argument("--device", type=str, choices=["cuda", "cpu"], default="cuda")
-    parser.add_argument("--save_every", type=int, default=50000)
-    parser.add_argument("--backend", type=str, choices=["auto", "mjlab", "mujoco"], default="auto")
-    parser.add_argument("--debug", action="store_true")
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
+def main(args: TrainArgs) -> None:
     resolved_device = _resolve_device(args.device)
     if args.device == "cuda" and resolved_device == "cpu":
         print("CUDA requested but unavailable. Falling back to CPU for training.")
 
     default_envs = 1024 if resolved_device == "cuda" else 256
-    num_envs = args.num_envs if args.num_envs is not None else default_envs
+    num_envs = int(args.num_envs if args.num_envs is not None else default_envs)
     if args.debug:
         num_envs = 1
 
@@ -74,7 +74,7 @@ def main() -> None:
         seed=args.seed,
         run_name=args.run_name,
         split="train",
-        backend=args.backend,
+        device=resolved_device,
         debug=args.debug,
     )
 
@@ -88,22 +88,16 @@ def main() -> None:
     train_cfg["seed"] = args.seed
 
     cfg_dump = {
-        "args": {
-            "run_name": args.run_name,
-            "robot": args.robot,
-            "seed": args.seed,
-            "total_timesteps": args.total_timesteps,
-            "num_envs": num_envs,
-            "device": resolved_device,
-            "save_every": args.save_every,
-            "backend": args.backend,
-        },
+        "args": asdict(args),
+        "resolved_device": resolved_device,
+        "num_envs": num_envs,
         "train_cfg": train_cfg,
+        "task_cfg": asdict(task_cfg),
+        "robot_source": robot_cfg.source_reference,
     }
     (run_path / "train_config.json").write_text(json.dumps(cfg_dump, indent=2), encoding="utf-8")
 
     runner = OnPolicyRunner(env=env, train_cfg=train_cfg, log_dir=None, device=resolved_device)
-    # Cross-version guard for rsl_rl logger behavior differences.
     if hasattr(runner, "disable_logs"):
         runner.disable_logs = True
     runner.logger_type = getattr(runner, "logger_type", "tensorboard")
@@ -126,7 +120,7 @@ def main() -> None:
         done_timesteps += transitions_per_iter
 
         if done_timesteps >= next_save or iteration == total_iterations:
-            ckpt_file = ckpt_path / f"model_steps_{done_timesteps}.pt"
+            ckpt_file = ckpt_path / f"model_{args.robot}_steps_{done_timesteps}.pt"
             runner.save(
                 str(ckpt_file),
                 infos={
@@ -146,15 +140,15 @@ def main() -> None:
                 f"timesteps={done_timesteps}/{args.total_timesteps}"
             )
 
-    print("Training finished. Running deterministic evaluation (50 episodes).")
+    eval_episodes = max(1, int(args.eval_episodes))
+    print(f"Training finished. Running deterministic evaluation ({eval_episodes} episodes).")
     evaluate_checkpoint(
         run_name=args.run_name,
         robot=args.robot,
         checkpoint_path=latest_checkpoint,
-        episodes=50,
+        episodes=eval_episodes,
         seed=args.seed,
         device=resolved_device,
-        backend=args.backend,
         debug=args.debug,
     )
 
@@ -162,4 +156,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main(tyro.cli(TrainArgs))

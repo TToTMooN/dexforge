@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dexplay"
 version = "0.1.0"
-description = "Phase-0 dexterous RL playground using rsl_rl with a MuJoCo fallback backend"
+description = "Phase-0 dexterous RL playground using mjlab + rsl_rl"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "dexplay" }]

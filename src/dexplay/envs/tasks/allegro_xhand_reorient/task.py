@@ -1,27 +1,33 @@
 from __future__ import annotations
 
 import math
-import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
 import torch
-from rsl_rl.env import VecEnv
-from tensordict import TensorDict
+from mjlab.entity import EntityCfg
+from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
+from mjlab.envs.mdp import terminations as common_terminations
+from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers.manager_term_config import EventTermCfg as EventTerm
+from mjlab.managers.manager_term_config import ObservationGroupCfg as ObsGroup
+from mjlab.managers.manager_term_config import ObservationTermCfg as ObsTerm
+from mjlab.managers.manager_term_config import RewardTermCfg as RewardTerm
+from mjlab.managers.manager_term_config import TerminationTermCfg as DoneTerm
+from mjlab.managers.manager_term_config import term
+from mjlab.managers.scene_entity_config import SceneEntityCfg
+from mjlab.rl import RslRlVecEnvWrapper
+from mjlab.scene import SceneCfg
+from mjlab.sim import MujocoCfg, SimulationCfg
+from mjlab.terrains import TerrainImporterCfg
 
 from dexplay.envs.robots.common_robot_cfg import RobotCfg
+from dexplay.envs.tasks.allegro_xhand_reorient import mdp
 from dexplay.envs.tasks.allegro_xhand_reorient.config import ReorientTaskCfg
 from dexplay.utils.logging import EpisodeRecord, JsonlEpisodeLogger
 from dexplay.utils.paths import eval_log_path, train_log_path
-
-try:
-    import mujoco
-except ImportError as exc:  # pragma: no cover - import guard for runtime env setup
-    raise ImportError(
-        "mujoco is required for dexplay Phase-0. Install dependencies with `pixi install`."
-    ) from exc
-
 
 TERMINATION_SUCCESS = "SUCCESS"
 TERMINATION_DROP = "DROP"
@@ -30,418 +36,472 @@ TERMINATION_TIMEOUT = "TIMEOUT"
 TERMINATION_NAN = "NAN"
 
 
+def _as_tensor_env_ids(env, env_ids: torch.Tensor | slice | None) -> torch.Tensor:
+    if env_ids is None:
+        return torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+    if isinstance(env_ids, slice):
+        return torch.arange(env.num_envs, device=env.device, dtype=torch.long)[env_ids]
+    return env_ids.to(device=env.device, dtype=torch.long)
+
+
+def reset_reorient_state(
+    env,
+    env_ids: torch.Tensor | slice,
+    robot_asset_cfg: SceneEntityCfg,
+    cube_asset_cfg: SceneEntityCfg,
+    task_cfg: ReorientTaskCfg,
+) -> None:
+    env_ids = _as_tensor_env_ids(env, env_ids)
+    if env_ids.numel() == 0:
+        return
+
+    robot = env.scene[robot_asset_cfg.name]
+    cube = env.scene[cube_asset_cfg.name]
+
+    num = int(env_ids.numel())
+    q_default = env.robot_default_qpos[None].repeat(num, 1)
+    q_noise = torch.randn(num, env.robot_action_dim, device=env.device) * task_cfg.joint_noise_std
+    q = torch.clamp(q_default + q_noise, env.robot_joint_lower, env.robot_joint_upper)
+    qd = torch.randn(num, env.robot_action_dim, device=env.device) * task_cfg.joint_vel_noise_std
+    robot.write_joint_state_to_sim(q, qd, env_ids=env_ids)
+
+    origins = env.scene.env_origins[env_ids]
+    cube_pos = origins + torch.tensor([0.0, 0.0, 0.125], device=env.device)
+    cube_pos += torch.randn(num, 3, device=env.device) * task_cfg.cube_pos_noise
+    cube_quat = mdp.sample_perturbed_quat(num, task_cfg.cube_quat_noise_rad, env.device)
+    cube_pose = torch.cat((cube_pos, cube_quat), dim=-1)
+
+    cube.write_root_link_pose_to_sim(cube_pose, env_ids=env_ids)
+    cube.write_root_link_velocity_to_sim(torch.zeros(num, 6, device=env.device), env_ids=env_ids)
+
+    env.target_quat[env_ids] = mdp.sample_random_quat(num, env.device)
+    env.success_streak[env_ids] = 0
+    env.last_orientation_error[env_ids] = math.pi
+    env.last_palm_distance[env_ids] = 0.0
+    env.last_action_norm[env_ids] = 0.0
+    env.last_drop[env_ids] = False
+    env.last_oob[env_ids] = False
+    env.last_nan[env_ids] = False
+
+
 @dataclass
-class EpisodeStats:
-    episode_return: float = 0.0
-    episode_length: int = 0
-    action_norm_sum: float = 0.0
-    max_action_norm: float = 0.0
-
-
-def _normalize_quat(q: np.ndarray) -> np.ndarray:
-    denom = np.linalg.norm(q)
-    if denom < 1e-9:
-        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-    return q / denom
-
-
-def _quat_conjugate(q: np.ndarray) -> np.ndarray:
-    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float64)
-
-
-def _quat_multiply(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    aw, ax, ay, az = a
-    bw, bx, by, bz = b
-    return np.array(
-        [
-            aw * bw - ax * bx - ay * by - az * bz,
-            aw * bx + ax * bw + ay * bz - az * by,
-            aw * by - ax * bz + ay * bw + az * bx,
-            aw * bz + ax * by - ay * bx + az * bw,
-        ],
-        dtype=np.float64,
+class ReorientActionCfg:
+    joint_pos: JointPositionActionCfg = term(
+        JointPositionActionCfg,
+        asset_name="robot",
+        actuator_names=[".*"],
+        scale=0.1,
+        use_default_offset=True,
     )
 
 
-def _axis_angle_to_quat(axis: np.ndarray, angle: float) -> np.ndarray:
-    norm = np.linalg.norm(axis)
-    if norm < 1e-9 or abs(angle) < 1e-9:
-        return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-    axis = axis / norm
-    half = 0.5 * angle
-    s = math.sin(half)
-    return _normalize_quat(np.array([math.cos(half), axis[0] * s, axis[1] * s, axis[2] * s]))
+@dataclass
+class ReorientObservationCfg:
+    @dataclass
+    class PolicyCfg(ObsGroup):
+        joint_pos: ObsTerm = term(
+            ObsTerm,
+            func=mdp.robot_joint_pos,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+        )
+        joint_vel: ObsTerm = term(
+            ObsTerm,
+            func=mdp.robot_joint_vel,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"])},
+        )
+        cube_pos: ObsTerm = term(
+            ObsTerm,
+            func=mdp.cube_pos,
+            params={"asset_cfg": SceneEntityCfg("cube")},
+        )
+        cube_quat: ObsTerm = term(
+            ObsTerm,
+            func=mdp.cube_quat,
+            params={"asset_cfg": SceneEntityCfg("cube")},
+        )
+        cube_linvel: ObsTerm = term(
+            ObsTerm,
+            func=mdp.cube_linvel,
+            params={"asset_cfg": SceneEntityCfg("cube")},
+        )
+        cube_angvel: ObsTerm = term(
+            ObsTerm,
+            func=mdp.cube_angvel,
+            params={"asset_cfg": SceneEntityCfg("cube")},
+        )
+
+    @dataclass
+    class CriticCfg(PolicyCfg):
+        pass
+
+    policy: PolicyCfg = field(default_factory=PolicyCfg)
+    critic: CriticCfg = field(default_factory=CriticCfg)
 
 
-def _quat_to_axis_angle(q: np.ndarray) -> tuple[np.ndarray, float]:
-    q = _normalize_quat(q)
-    w = float(np.clip(q[0], -1.0, 1.0))
-    angle = 2.0 * math.acos(w)
-    s = math.sqrt(max(1.0 - w * w, 0.0))
-    if s < 1e-8:
-        return np.array([1.0, 0.0, 0.0], dtype=np.float64), 0.0
-    axis = q[1:] / s
-    return axis.astype(np.float64), angle
+@dataclass
+class ReorientRewardCfg:
+    orientation: RewardTerm = term(RewardTerm, func=mdp.reward_orientation_error, weight=-20.0)
+    palm_distance: RewardTerm = term(
+        RewardTerm,
+        func=mdp.reward_cube_palm_distance,
+        weight=-4.0,
+    )
+    action_penalty: RewardTerm = term(
+        RewardTerm,
+        func=mdp.reward_action_norm,
+        weight=-1.5,
+    )
+    success_bonus: RewardTerm = term(
+        RewardTerm,
+        func=mdp.reward_success_bonus,
+        weight=45.0,
+        params={"hold_steps": 10},
+    )
 
 
-def _quat_angle_distance(q: np.ndarray, q_target: np.ndarray) -> float:
-    dq = _normalize_quat(_quat_multiply(q_target, _quat_conjugate(q)))
-    angle = 2.0 * math.acos(float(np.clip(abs(dq[0]), -1.0, 1.0)))
-    return min(angle, 2.0 * math.pi - angle)
+@dataclass
+class ReorientTerminationCfg:
+    time_out: DoneTerm = term(DoneTerm, func=common_terminations.time_out, time_out=True)
+    success_hold: DoneTerm = term(
+        DoneTerm,
+        func=mdp.term_success_hold,
+        params={"hold_steps": 10},
+    )
+    drop: DoneTerm = term(DoneTerm, func=mdp.term_drop)
+    oob: DoneTerm = term(DoneTerm, func=mdp.term_oob)
+    nan_state: DoneTerm = term(DoneTerm, func=mdp.term_nan)
 
 
-def _random_unit_vector(rng: np.random.Generator) -> np.ndarray:
-    v = rng.normal(size=3)
-    n = np.linalg.norm(v)
-    if n < 1e-9:
-        return np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    return v / n
+@dataclass
+class ReorientEventCfg:
+    reset_task_state: EventTerm = term(
+        EventTerm,
+        func=reset_reorient_state,
+        mode="reset",
+        params={
+            "robot_asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
+            "cube_asset_cfg": SceneEntityCfg("cube"),
+            "task_cfg": ReorientTaskCfg(),
+        },
+    )
 
 
-def _random_quat(rng: np.random.Generator) -> np.ndarray:
-    axis = _random_unit_vector(rng)
-    angle = rng.uniform(-math.pi, math.pi)
-    return _axis_angle_to_quat(axis, angle)
+@dataclass
+class ReorientManagerEnvCfg(ManagerBasedRlEnvCfg):
+    scene: SceneCfg = field(
+        default_factory=lambda: SceneCfg(
+            num_envs=1,
+            env_spacing=0.55,
+            terrain=TerrainImporterCfg(terrain_type="plane"),
+            extent=1.0,
+        )
+    )
+    observations: ReorientObservationCfg = field(default_factory=ReorientObservationCfg)
+    actions: ReorientActionCfg = field(default_factory=ReorientActionCfg)
+    rewards: ReorientRewardCfg = field(default_factory=ReorientRewardCfg)
+    terminations: ReorientTerminationCfg = field(default_factory=ReorientTerminationCfg)
+    events: ReorientEventCfg = field(default_factory=ReorientEventCfg)
+    sim: SimulationCfg = field(
+        default_factory=lambda: SimulationCfg(
+            nconmax=30_000,
+            njmax=3_000,
+            mujoco=MujocoCfg(
+                timestep=0.0025,
+                integrator="implicitfast",
+                gravity=(0.0, 0.0, -1.5),
+                iterations=25,
+                ls_iterations=30,
+            ),
+        )
+    )
+    decimation: int = 10
+    episode_length_s: float = 6.0
+    is_finite_horizon: bool = False
 
 
-def _quat_perturb(base_quat: np.ndarray, max_angle: float, rng: np.random.Generator) -> np.ndarray:
-    axis = _random_unit_vector(rng)
-    angle = rng.uniform(-max_angle, max_angle)
-    return _normalize_quat(_quat_multiply(_axis_angle_to_quat(axis, angle), base_quat))
+def _cube_entity_cfg(cube_xml_path: Path) -> EntityCfg:
+    import mujoco
+
+    return EntityCfg(
+        spec_fn=lambda: mujoco.MjSpec.from_file(str(cube_xml_path)),
+        init_state=EntityCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 0.13),
+            rot=(1.0, 0.0, 0.0, 0.0),
+            lin_vel=(0.0, 0.0, 0.0),
+            ang_vel=(0.0, 0.0, 0.0),
+        ),
+        articulation=None,
+    )
 
 
-class ReorientEnv:
-    """Single-environment Phase-0 in-hand reorientation task."""
+def build_reorient_mjlab_cfg(
+    robot_cfg: RobotCfg,
+    task_cfg: ReorientTaskCfg,
+    num_envs: int,
+    seed: int,
+) -> ReorientManagerEnvCfg:
+    cfg = ReorientManagerEnvCfg()
+    cfg.seed = seed
+    cfg.scene.num_envs = int(num_envs)
+    cfg.decimation = task_cfg.decimation
+    cfg.episode_length_s = task_cfg.max_episode_seconds
+
+    cfg.sim.mujoco.timestep = task_cfg.sim_dt
+
+    cube_xml = Path(__file__).resolve().parent / "model" / "cube.xml"
+    cfg.scene.entities = {
+        "robot": robot_cfg.to_mjlab_entity_cfg(),
+        "cube": _cube_entity_cfg(cube_xml),
+    }
+
+    palm_site_cfg = SceneEntityCfg(
+        "robot", site_names=[robot_cfg.palm_site_name], preserve_order=True
+    )
+    joint_cfg = SceneEntityCfg(
+        "robot", joint_names=list(robot_cfg.joint_names), preserve_order=True
+    )
+
+    cfg.observations.policy.joint_pos.params["asset_cfg"] = joint_cfg
+    cfg.observations.policy.joint_vel.params["asset_cfg"] = joint_cfg
+    cfg.observations.critic.joint_pos.params["asset_cfg"] = joint_cfg
+    cfg.observations.critic.joint_vel.params["asset_cfg"] = joint_cfg
+
+    cfg.actions.joint_pos.scale = robot_cfg.action_scale
+
+    cfg.rewards.orientation.weight = -task_cfg.reward_ori_scale
+    cfg.rewards.palm_distance.weight = -task_cfg.reward_dist_scale
+    cfg.rewards.action_penalty.weight = -task_cfg.reward_action_scale
+    cfg.rewards.success_bonus.weight = task_cfg.success_bonus
+    cfg.rewards.success_bonus.params["hold_steps"] = task_cfg.success_hold_steps
+
+    cfg.terminations.success_hold.params["hold_steps"] = task_cfg.success_hold_steps
+
+    cfg.events.reset_task_state.params["robot_asset_cfg"] = joint_cfg
+    cfg.events.reset_task_state.params["cube_asset_cfg"] = SceneEntityCfg("cube")
+    cfg.events.reset_task_state.params["task_cfg"] = task_cfg
+
+    # Cache useful config for state updates.
+    cfg._robot_joint_cfg = joint_cfg  # type: ignore[attr-defined]
+    cfg._palm_site_cfg = palm_site_cfg  # type: ignore[attr-defined]
+    cfg._cube_cfg = SceneEntityCfg("cube")  # type: ignore[attr-defined]
+    cfg._robot_cfg = robot_cfg  # type: ignore[attr-defined]
+    cfg._task_cfg = task_cfg  # type: ignore[attr-defined]
+
+    return cfg
+
+
+class ReorientMjlabEnv(ManagerBasedRlEnv):
+    """Manager-based Phase-0 in-hand reorientation environment on mjlab."""
 
     def __init__(
         self,
+        cfg: ReorientManagerEnvCfg,
         robot_cfg: RobotCfg,
         task_cfg: ReorientTaskCfg,
-        seed: int,
-        backend: Literal["auto", "mjlab", "mujoco"] = "auto",
+        device: str,
         debug: bool = False,
     ) -> None:
-        self.robot_cfg = robot_cfg
+        self.robot_name = robot_cfg.name
         self.task_cfg = task_cfg
-        self.seed = seed
         self.debug = debug
-        self.rng = np.random.default_rng(seed)
 
-        self.backend = self._resolve_backend(backend)
+        super().__init__(cfg=cfg, device=device)
 
-        self.model = mujoco.MjModel.from_xml_path(str(robot_cfg.mjcf_path))
-        self.model.opt.timestep = task_cfg.sim_dt
-        self.data = mujoco.MjData(self.model)
-
-        self._joint_ids = np.array(
-            [
-                mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, n)
-                for n in robot_cfg.joint_names
-            ],
-            dtype=np.int32,
+        n = self.num_envs
+        self.robot_action_dim = robot_cfg.action_dim
+        self.robot_joint_lower = torch.tensor(
+            robot_cfg.joint_lower, dtype=torch.float32, device=self.device
         )
-        self._joint_qpos_ids = self.model.jnt_qposadr[self._joint_ids].astype(np.int32)
-        self._joint_dof_ids = self.model.jnt_dofadr[self._joint_ids].astype(np.int32)
-
-        self._palm_site_id = mujoco.mj_name2id(
-            self.model,
-            mujoco.mjtObj.mjOBJ_SITE,
-            robot_cfg.palm_site_name,
+        self.robot_joint_upper = torch.tensor(
+            robot_cfg.joint_upper, dtype=torch.float32, device=self.device
+        )
+        self.robot_default_qpos = torch.tensor(
+            robot_cfg.default_qpos, dtype=torch.float32, device=self.device
         )
 
-        cube_joint_id = mujoco.mj_name2id(
-            self.model,
-            mujoco.mjtObj.mjOBJ_JOINT,
-            robot_cfg.cube_joint_name,
+        self._robot_state_cfg = SceneEntityCfg(
+            "robot", joint_names=list(robot_cfg.joint_names), preserve_order=True
         )
-        self._cube_qpos_adr = int(self.model.jnt_qposadr[cube_joint_id])
-        self._cube_dof_adr = int(self.model.jnt_dofadr[cube_joint_id])
+        self._robot_state_cfg.resolve(self.scene)
+        self._cube_state_cfg = SceneEntityCfg("cube")
+        self._cube_state_cfg.resolve(self.scene)
+        self._palm_site_cfg = SceneEntityCfg(
+            "robot", site_names=[robot_cfg.palm_site_name], preserve_order=True
+        )
+        self._palm_site_cfg.resolve(self.scene)
 
-        self._joint_lower = robot_cfg.joint_lower_np()
-        self._joint_upper = robot_cfg.joint_upper_np()
-        self._default_qpos = robot_cfg.default_qpos_np()
-        self._kp = robot_cfg.kp_np()
-        self._kd = robot_cfg.kd_np()
-        self._torque_lower = robot_cfg.torque_lower_np()
-        self._torque_upper = robot_cfg.torque_upper_np()
+        self.target_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device).repeat(n, 1)
+        self.success_streak = torch.zeros(n, dtype=torch.long, device=self.device)
 
-        self.target_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
-        self.success_streak = 0
-        self.stats = EpisodeStats()
-        self.global_step = 0
-        self._last_obs = np.zeros(self.observation_dim, dtype=np.float32)
+        self.last_orientation_error = torch.full(
+            (n,), math.pi, dtype=torch.float32, device=self.device
+        )
+        self.last_palm_distance = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self.last_action_norm = torch.zeros(n, dtype=torch.float32, device=self.device)
+        self.last_drop = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.last_oob = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.last_nan = torch.zeros(n, dtype=torch.bool, device=self.device)
 
-        self.reset()
+        # Preserved across per-step resets for logging after done envs are auto-reset.
+        self.last_done_orientation_error = self.last_orientation_error.clone()
+        self.last_done_success = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.last_done_drop = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.last_done_oob = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.last_done_nan = torch.zeros(n, dtype=torch.bool, device=self.device)
 
-    @property
-    def action_dim(self) -> int:
-        return self.robot_cfg.action_dim
+    def _apply_cube_assist(self) -> None:
+        robot = self.scene[self._robot_state_cfg.name]
+        cube = self.scene[self._cube_state_cfg.name]
 
-    @property
-    def observation_dim(self) -> int:
-        return 2 * self.action_dim + 13
+        cube_pos = cube.data.root_link_pos_w
+        cube_quat = mdp.normalize_quat(cube.data.root_link_quat_w)
 
-    @property
-    def episode_length(self) -> int:
-        return self.stats.episode_length
+        palm_site_pose = robot.data.site_pose_w[:, self._palm_site_cfg.site_ids, :3]
+        palm_pos = palm_site_pose[:, 0, :] if palm_site_pose.ndim == 3 else palm_site_pose
 
-    def _resolve_backend(self, backend: str) -> str:
-        if backend == "mujoco":
-            return "mujoco"
-        if backend not in {"auto", "mjlab"}:
-            raise ValueError(f"Unsupported backend '{backend}'. Use auto|mjlab|mujoco")
+        target = mdp.normalize_quat(self.target_quat)
+        err_quat = mdp.normalize_quat(mdp.quat_mul(target, mdp.quat_conjugate(cube_quat)))
+        err_axis = mdp.quat_to_axis(err_quat)
 
-        try:
-            import mjlab  # noqa: F401
+        action_energy = self.last_action_norm
+        assist_angle = self.task_cfg.orientation_assist_gain * action_energy * self.step_dt
+        assist_angle = torch.clamp(assist_angle, max=self.task_cfg.max_assist_angle_per_step)
 
-            warnings.warn(
-                "mjlab detected. Phase-0 currently executes the stable MuJoCo CPU backend while "
-                "keeping a manager-style env API for future mjlab migration.",
-                stacklevel=2,
+        delta_quat = mdp.axis_angle_to_quat(err_axis, assist_angle[:, None])
+        new_quat = mdp.normalize_quat(mdp.quat_mul(delta_quat, cube_quat))
+
+        anchor = palm_pos + torch.tensor(
+            [0.0, 0.0, self.task_cfg.cube_anchor_height], device=self.device
+        )
+        new_pos = cube_pos + self.task_cfg.cube_anchor_gain * (anchor - cube_pos)
+
+        action = self.action_manager.action
+        slip = torch.clamp(action_energy - self.task_cfg.slip_action_threshold, min=0.0)
+
+        if action.shape[1] > 0:
+            x_comp = action[:, 0::3].mean(dim=1)
+            y_comp = (
+                action[:, 1::3].mean(dim=1) if action.shape[1] > 1 else torch.zeros_like(x_comp)
             )
-            return "mujoco"
-        except Exception:
-            if backend == "mjlab":
-                warnings.warn(
-                    "Requested backend=mjlab, but mjlab import failed. Falling back to mujoco.",
-                    stacklevel=2,
-                )
-            return "mujoco"
+            dir_xy = torch.stack((x_comp, y_comp), dim=-1)
+            dir_xy = dir_xy / torch.clamp(torch.linalg.norm(dir_xy, dim=-1, keepdim=True), min=1e-6)
+            new_pos[:, :2] += self.task_cfg.slip_xy_gain * slip[:, None] * dir_xy
 
-    def _cube_pos(self) -> np.ndarray:
-        return self.data.qpos[self._cube_qpos_adr : self._cube_qpos_adr + 3]
+        new_pos[:, 2] -= self.task_cfg.slip_z_gain * slip
 
-    def _cube_quat(self) -> np.ndarray:
-        return self.data.qpos[self._cube_qpos_adr + 3 : self._cube_qpos_adr + 7]
+        cube.write_root_link_pose_to_sim(torch.cat((new_pos, new_quat), dim=-1))
 
-    def _set_cube_pose(self, pos: np.ndarray, quat: np.ndarray) -> None:
-        self.data.qpos[self._cube_qpos_adr : self._cube_qpos_adr + 3] = pos
-        self.data.qpos[self._cube_qpos_adr + 3 : self._cube_qpos_adr + 7] = _normalize_quat(quat)
+        cube_vel = torch.zeros(self.num_envs, 6, device=self.device)
+        cube_vel[:, 3:] = err_axis * (assist_angle / max(self.step_dt, 1e-6))[:, None]
+        cube.write_root_link_velocity_to_sim(cube_vel)
 
-    def _sample_target_quat(self) -> np.ndarray:
-        return _random_quat(self.rng)
+    def _update_task_state(self) -> None:
+        robot = self.scene[self._robot_state_cfg.name]
+        cube = self.scene[self._cube_state_cfg.name]
 
-    def _workspace_violation(self, cube_pos: np.ndarray) -> bool:
-        low = np.asarray(self.task_cfg.workspace_low, dtype=np.float64)
-        high = np.asarray(self.task_cfg.workspace_high, dtype=np.float64)
-        return bool(np.any(cube_pos < low) or np.any(cube_pos > high))
-
-    def _safe_obs(self, obs: np.ndarray) -> np.ndarray:
-        if np.isfinite(obs).all():
-            return obs.astype(np.float32)
-        return np.zeros_like(obs, dtype=np.float32)
-
-    def _collect_obs(self) -> np.ndarray:
-        qpos = self.data.qpos[self._joint_qpos_ids]
-        qvel = self.data.qvel[self._joint_dof_ids]
-
-        cube_pos = self._cube_pos()
-        cube_quat = _normalize_quat(self._cube_quat())
-        cube_vel = self.data.qvel[self._cube_dof_adr : self._cube_dof_adr + 3]
-        cube_ang = self.data.qvel[self._cube_dof_adr + 3 : self._cube_dof_adr + 6]
-
-        obs = np.concatenate(
-            [qpos, qvel, cube_pos, cube_quat, cube_vel, cube_ang],
-            axis=0,
-        ).astype(np.float32)
-        self._last_obs = obs
-        return obs
-
-    def _apply_pd_control(self, target_qpos: np.ndarray) -> None:
-        for _ in range(self.task_cfg.frame_skip):
-            q = self.data.qpos[self._joint_qpos_ids]
-            qd = self.data.qvel[self._joint_dof_ids]
-            tau = self._kp * (target_qpos - q) - self._kd * qd
-            tau = np.clip(tau, self._torque_lower, self._torque_upper)
-            self.data.qfrc_applied[:] = 0.0
-            self.data.qfrc_applied[self._joint_dof_ids] = tau
-            mujoco.mj_step(self.model, self.data)
-
-    def _apply_cube_assist(self, action: np.ndarray) -> None:
-        cube_quat = _normalize_quat(self._cube_quat())
-        err_quat = _normalize_quat(_quat_multiply(self.target_quat, _quat_conjugate(cube_quat)))
-        err_axis, _ = _quat_to_axis_angle(err_quat)
-
-        action_energy = float(np.linalg.norm(action) / math.sqrt(float(action.size)))
-        assist_angle = (
-            self.task_cfg.orientation_assist_gain * action_energy * self.task_cfg.control_dt
-        )
-        assist_angle = min(assist_angle, self.task_cfg.max_assist_angle_per_step)
-
-        delta_quat = _axis_angle_to_quat(err_axis, assist_angle)
-        new_quat = _normalize_quat(_quat_multiply(delta_quat, cube_quat))
-
-        palm_pos = self.data.site_xpos[self._palm_site_id]
-        anchor_pos = np.array(
-            [palm_pos[0], palm_pos[1], palm_pos[2] + self.task_cfg.cube_anchor_height],
-            dtype=np.float64,
+        cube_pos, _cube_quat, ori_err, palm_dist = mdp.compute_reorient_state(
+            self,
+            self._robot_state_cfg,
+            self._cube_state_cfg,
+            self._palm_site_cfg,
         )
 
-        cube_pos = self._cube_pos().copy()
-        cube_pos += self.task_cfg.cube_anchor_gain * (anchor_pos - cube_pos)
+        self.last_orientation_error = ori_err
+        self.last_palm_distance = palm_dist
 
-        slip = max(action_energy - self.task_cfg.slip_action_threshold, 0.0)
-        if slip > 0.0:
-            axis_hint = np.array(
-                [
-                    float(np.mean(action[0::3])) if action.size >= 1 else 0.0,
-                    float(np.mean(action[1::3])) if action.size >= 2 else 0.0,
-                    float(np.mean(action[2::3])) if action.size >= 3 else 0.0,
-                ],
-                dtype=np.float64,
-            )
-            dir_xy = axis_hint[:2]
-            norm_xy = np.linalg.norm(dir_xy)
-            if norm_xy > 1e-8:
-                dir_xy = dir_xy / norm_xy
-            cube_pos[0:2] += self.task_cfg.slip_xy_gain * slip * dir_xy
-            cube_pos[2] -= self.task_cfg.slip_z_gain * slip
-
-        self._set_cube_pose(cube_pos, new_quat)
-        self.data.qvel[self._cube_dof_adr : self._cube_dof_adr + 3] *= 0.2
-        self.data.qvel[self._cube_dof_adr + 3 : self._cube_dof_adr + 6] = (
-            err_axis * assist_angle / max(self.task_cfg.control_dt, 1e-6)
+        self.success_streak = torch.where(
+            ori_err < self.task_cfg.orientation_tolerance_rad,
+            self.success_streak + 1,
+            torch.zeros_like(self.success_streak),
         )
-        mujoco.mj_forward(self.model, self.data)
 
-    def reset(self) -> tuple[np.ndarray, dict]:
-        mujoco.mj_resetData(self.model, self.data)
-
-        joint_noise = self.rng.normal(0.0, self.task_cfg.joint_noise_std, size=self.action_dim)
-        q0 = np.clip(self._default_qpos + joint_noise, self._joint_lower, self._joint_upper)
-        self.data.qpos[self._joint_qpos_ids] = q0
-        self.data.qvel[self._joint_dof_ids] = self.rng.normal(0.0, 0.02, size=self.action_dim)
-
-        mujoco.mj_forward(self.model, self.data)
-        palm_pos = self.data.site_xpos[self._palm_site_id].copy()
-
-        cube_pos = palm_pos + np.array(
-            [0.0, 0.0, self.task_cfg.cube_anchor_height], dtype=np.float64
+        self.last_drop = (cube_pos[:, 2] < self.task_cfg.drop_z_threshold) | (
+            palm_dist > self.task_cfg.drop_distance_threshold
         )
-        cube_pos += self.rng.normal(0.0, self.task_cfg.cube_pos_noise, size=3)
 
-        cube_quat = _quat_perturb(
-            np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64),
-            self.task_cfg.cube_quat_noise_rad,
-            self.rng,
+        low = torch.tensor(self.task_cfg.workspace_low, device=self.device)
+        high = torch.tensor(self.task_cfg.workspace_high, device=self.device)
+        self.last_oob = torch.any(cube_pos < low, dim=-1) | torch.any(cube_pos > high, dim=-1)
+
+        finite_flags = (
+            torch.isfinite(robot.data.joint_pos).all(dim=1)
+            & torch.isfinite(robot.data.joint_vel).all(dim=1)
+            & torch.isfinite(cube.data.root_link_pose_w).all(dim=1)
+            & torch.isfinite(cube.data.root_link_vel_w).all(dim=1)
+            & torch.isfinite(self.target_quat).all(dim=1)
+            & torch.isfinite(ori_err)
+            & torch.isfinite(palm_dist)
         )
-        self._set_cube_pose(cube_pos, cube_quat)
-        self.data.qvel[self._cube_dof_adr : self._cube_dof_adr + 6] = 0.0
+        self.last_nan = self.last_nan | (~finite_flags)
 
-        self.target_quat = self._sample_target_quat()
-        self.success_streak = 0
-        self.stats = EpisodeStats()
+    def step(self, action: torch.Tensor):
+        action = action.to(self.device)
+        invalid_action = ~torch.isfinite(action).all(dim=1)
+        action = torch.nan_to_num(action, nan=0.0, posinf=0.0, neginf=0.0)
+        action = torch.clamp(action, -1.0, 1.0)
 
-        mujoco.mj_forward(self.model, self.data)
-        obs = self._safe_obs(self._collect_obs())
-        return obs, {"target_quat": self.target_quat.copy()}
+        if action.shape[1] != self.action_manager.total_action_dim:
+            expected = self.action_manager.total_action_dim
+            raise ValueError(f"Action shape mismatch: got {action.shape[1]}, expected {expected}")
 
-    def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
-        action = np.asarray(action, dtype=np.float64).reshape(-1)
-        if action.size != self.action_dim:
-            raise ValueError(f"Action size mismatch: got {action.size}, expected {self.action_dim}")
+        self.last_action_norm = torch.linalg.norm(action, dim=1) / math.sqrt(
+            max(action.shape[1], 1)
+        )
+        self.last_nan = invalid_action.clone()
 
-        terminated = False
-        truncated = False
-        reason: str | None = None
+        self.action_manager.process_action(action)
 
-        if not np.isfinite(action).all():
-            action = np.zeros_like(action)
-            terminated = True
-            reason = TERMINATION_NAN
+        for _ in range(self.cfg.decimation):
+            self._sim_step_counter += 1
+            self.action_manager.apply_action()
+            self.scene.write_data_to_sim()
+            self.sim.step()
+            self.scene.update(dt=self.physics_dt)
 
-        action = np.clip(action, -1.0, 1.0)
-        action_norm = float(np.linalg.norm(action))
+        self._apply_cube_assist()
+        self.scene.write_data_to_sim()
+        self.sim.forward()
 
-        if reason is None:
-            delta = np.clip(
-                action * self.robot_cfg.action_scale,
-                -self.robot_cfg.target_delta_clip,
-                self.robot_cfg.target_delta_clip,
-            )
-            q = self.data.qpos[self._joint_qpos_ids].copy()
-            target = np.clip(q + delta, self._joint_lower, self._joint_upper)
+        self.episode_length_buf += 1
+        self.common_step_counter += 1
 
-            self._apply_pd_control(target)
-            self._apply_cube_assist(action)
+        self._update_task_state()
 
-        obs = self._collect_obs()
-        cube_pos = self._cube_pos().copy()
-        cube_quat = _normalize_quat(self._cube_quat().copy())
-        palm_pos = self.data.site_xpos[self._palm_site_id].copy()
+        self.reset_buf = self.termination_manager.compute()
+        self.reset_terminated = self.termination_manager.terminated
+        self.reset_time_outs = self.termination_manager.time_outs
 
-        ori_err = _quat_angle_distance(cube_quat, self.target_quat)
-        palm_dist = float(np.linalg.norm(cube_pos - palm_pos))
+        self.reward_buf = self.reward_manager.compute(dt=self.step_dt)
 
-        reward = -self.task_cfg.reward_ori_scale * ori_err
-        reward -= self.task_cfg.reward_dist_scale * palm_dist
-        reward -= self.task_cfg.reward_action_scale * action_norm
+        self.last_done_orientation_error = self.last_orientation_error.clone()
+        self.last_done_success = self.success_streak >= self.task_cfg.success_hold_steps
+        self.last_done_drop = self.last_drop.clone()
+        self.last_done_oob = self.last_oob.clone()
+        self.last_done_nan = self.last_nan.clone()
 
-        if np.isfinite(obs).all() and np.isfinite(reward):
-            if ori_err < self.task_cfg.orientation_tolerance_rad:
-                self.success_streak += 1
-            else:
-                self.success_streak = 0
-        else:
-            terminated = True
-            reason = TERMINATION_NAN
+        reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+        if len(reset_env_ids) > 0:
+            self._reset_idx(reset_env_ids)
+            self.scene.write_data_to_sim()
+            self.sim.forward()
 
-        self.stats.episode_return += float(reward)
-        self.stats.episode_length += 1
-        self.stats.action_norm_sum += action_norm
-        self.stats.max_action_norm = max(self.stats.max_action_norm, action_norm)
-        self.global_step += 1
+        self.command_manager.compute(dt=self.step_dt)
+        if "interval" in self.event_manager.available_modes:
+            self.event_manager.apply(mode="interval", dt=self.step_dt)
 
-        if reason is None and self.success_streak >= self.task_cfg.success_hold_steps:
-            reward += self.task_cfg.success_bonus
-            terminated = True
-            reason = TERMINATION_SUCCESS
+        self.obs_buf = self.observation_manager.compute()
 
-        if reason is None and (
-            cube_pos[2] < self.task_cfg.drop_z_threshold
-            or np.linalg.norm(cube_pos - palm_pos) > self.task_cfg.drop_distance_threshold
-        ):
-            terminated = True
-            reason = TERMINATION_DROP
-
-        if reason is None and self._workspace_violation(cube_pos):
-            terminated = True
-            reason = TERMINATION_OOB
-
-        if reason is None and self.stats.episode_length >= self.task_cfg.max_steps:
-            truncated = True
-            reason = TERMINATION_TIMEOUT
-
-        if reason is None and (not np.isfinite(obs).all() or not np.isfinite(reward)):
-            terminated = True
-            reason = TERMINATION_NAN
-
-        if self.debug and (self.global_step % self.task_cfg.debug_print_every == 0):
-            print(
-                f"[debug] step={self.global_step} err={ori_err:.3f} "
-                f"dist={palm_dist:.3f} rew={reward:.3f}"
-            )
-
-        info: dict = {}
-        if terminated or truncated:
-            mean_action = self.stats.action_norm_sum / max(self.stats.episode_length, 1)
-            info = {
-                "termination_reason": reason,
-                "episode_return": float(self.stats.episode_return),
-                "episode_length": int(self.stats.episode_length),
-                "final_orientation_error": float(ori_err),
-                "mean_action_norm": float(mean_action),
-                "max_action_norm": float(self.stats.max_action_norm),
-            }
-
-        return self._safe_obs(obs), float(reward), terminated, truncated, info
-
-    def close(self) -> None:
-        return
+        return (
+            self.obs_buf,
+            self.reward_buf,
+            self.reset_terminated,
+            self.reset_time_outs,
+            self.extras,
+        )
 
 
-class ReorientVecEnv(VecEnv):
-    """rsl_rl-compatible vectorized wrapper around `ReorientEnv`."""
+class ReorientVecEnv(RslRlVecEnvWrapper):
+    """rsl_rl-compatible wrapper with per-episode JSONL diagnostics."""
 
     def __init__(
         self,
@@ -451,142 +511,213 @@ class ReorientVecEnv(VecEnv):
         seed: int,
         run_name: str,
         split: Literal["train", "eval"],
-        backend: Literal["auto", "mjlab", "mujoco"] = "auto",
+        device: str,
         debug: bool = False,
     ) -> None:
-        self.robot_cfg = robot_cfg
-        self.task_cfg = task_cfg
-        self.num_envs = int(num_envs)
-        self.num_actions = robot_cfg.action_dim
-        self.max_episode_length = task_cfg.max_steps
-        self.device = torch.device("cpu")
+        cfg = build_reorient_mjlab_cfg(
+            robot_cfg=robot_cfg,
+            task_cfg=task_cfg,
+            num_envs=num_envs,
+            seed=seed,
+        )
+        env = ReorientMjlabEnv(
+            cfg=cfg,
+            robot_cfg=robot_cfg,
+            task_cfg=task_cfg,
+            device=device,
+            debug=debug,
+        )
+        super().__init__(env=env, clip_actions=1.0)
 
-        self.cfg = {
-            "robot": robot_cfg.name,
-            "backend": backend,
-            "sim_dt": task_cfg.sim_dt,
-            "control_hz": task_cfg.control_hz,
-        }
-
-        log_path = train_log_path(run_name) if split == "train" else eval_log_path(run_name)
-        self.logger = JsonlEpisodeLogger(log_path)
         self.run_name = run_name
+        self.robot_name = robot_cfg.name
+        self.seed = int(seed)
         self.split = split
-        self.seed = seed
 
-        self.envs = [
-            ReorientEnv(
-                robot_cfg=robot_cfg,
-                task_cfg=task_cfg,
-                seed=seed + (i * 1009),
-                backend=backend,
-                debug=debug and i == 0,
-            )
-            for i in range(self.num_envs)
-        ]
-
-        obs0, _ = self.envs[0].reset()
-        self.num_obs = int(obs0.shape[0])
-        self.obs_buf = np.zeros((self.num_envs, self.num_obs), dtype=np.float32)
-        self.rew_buf = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
-        self.done_buf = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        self.episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self._timeouts = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        path = train_log_path(run_name) if split == "train" else eval_log_path(run_name)
+        self.logger = JsonlEpisodeLogger(path)
 
         self._episode_counter = 0
         self._recent_records: list[EpisodeRecord] = []
 
-        self.reset()
+        self._episode_return = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._episode_length = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._action_norm_sum = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        self._action_norm_max = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
 
-    def _tensor_obs(self) -> TensorDict:
-        obs_t = torch.as_tensor(self.obs_buf, dtype=torch.float32, device=self.device)
-        return TensorDict(
-            {
-                "policy": obs_t,
-                "critic": obs_t,
-            },
-            batch_size=[self.num_envs],
-            device=self.device,
-        )
-
-    def reset(self) -> TensorDict:
-        for i, env in enumerate(self.envs):
-            obs, _ = env.reset()
-            self.obs_buf[i] = obs
-            self.episode_length_buf[i] = 0
-        self.done_buf.zero_()
-        self._timeouts.zero_()
-        return self._tensor_obs()
-
-    def get_observations(self) -> TensorDict:
-        return self._tensor_obs()
+        self._seed_offset = torch.arange(self.num_envs, device=self.device, dtype=torch.long) * 1009
 
     def consume_recent_records(self) -> list[EpisodeRecord]:
         out = self._recent_records
         self._recent_records = []
         return out
 
-    def step(self, actions: torch.Tensor) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
-        act = actions.detach().to("cpu").numpy()
-        if act.shape != (self.num_envs, self.num_actions):
-            expected_shape = (self.num_envs, self.num_actions)
-            raise ValueError(
-                f"Action tensor shape mismatch: got {act.shape}, expected {expected_shape}"
-            )
+    def _reasons_for(self, done_ids: torch.Tensor, timeouts: torch.Tensor) -> list[str]:
+        reasons: list[str] = []
+        for env_id in done_ids.tolist():
+            if bool(timeouts[env_id].item()):
+                reasons.append(TERMINATION_TIMEOUT)
+            elif bool(self.unwrapped.last_done_nan[env_id].item()):
+                reasons.append(TERMINATION_NAN)
+            elif bool(self.unwrapped.last_done_success[env_id].item()):
+                reasons.append(TERMINATION_SUCCESS)
+            elif bool(self.unwrapped.last_done_drop[env_id].item()):
+                reasons.append(TERMINATION_DROP)
+            elif bool(self.unwrapped.last_done_oob[env_id].item()):
+                reasons.append(TERMINATION_OOB)
+            else:
+                reasons.append(TERMINATION_NAN)
+        return reasons
 
-        self._timeouts.zero_()
-        completed_returns: list[float] = []
-        completed_lengths: list[float] = []
-        completed_success: list[float] = []
+    def step(self, actions: torch.Tensor):
+        action_norm = torch.linalg.norm(actions.to(self.device), dim=1)
 
-        for i, env in enumerate(self.envs):
-            obs, rew, terminated, truncated, info = env.step(act[i])
-            done = terminated or truncated
+        obs, rewards, dones, extras = super().step(actions)
 
-            self.obs_buf[i] = obs
-            self.rew_buf[i] = float(rew)
-            self.done_buf[i] = bool(done)
-            self.episode_length_buf[i] = env.episode_length
+        done_mask = dones.to(dtype=torch.bool)
+        self._episode_return += rewards
+        self._episode_length += 1
+        self._action_norm_sum += action_norm
+        self._action_norm_max = torch.maximum(self._action_norm_max, action_norm)
 
-            if done:
-                reason = str(info.get("termination_reason", TERMINATION_NAN))
-                record = EpisodeRecord(
+        if torch.any(done_mask):
+            done_ids = torch.nonzero(done_mask, as_tuple=False).squeeze(-1)
+            timeouts = extras.get("time_outs", torch.zeros_like(done_mask))
+            reasons = self._reasons_for(done_ids, timeouts)
+
+            for idx, env_id in enumerate(done_ids.tolist()):
+                episode_length = int(self._episode_length[env_id].item())
+                mean_action = self._action_norm_sum[env_id] / max(episode_length, 1)
+                reason = reasons[idx]
+
+                rec = EpisodeRecord(
                     run_name=self.run_name,
-                    robot_name=self.robot_cfg.name,
+                    robot_name=self.robot_name,
                     episode_id=self._episode_counter,
-                    seed=self.seed + (i * 1009),
+                    seed=int((self.seed + self._seed_offset[env_id]).item()),
                     termination_reason=reason,
-                    episode_return=float(info.get("episode_return", 0.0)),
-                    episode_length=int(info.get("episode_length", 0)),
-                    final_orientation_error=float(info.get("final_orientation_error", math.inf)),
-                    mean_action_norm=float(info.get("mean_action_norm", 0.0)),
-                    max_action_norm=float(info.get("max_action_norm", 0.0)),
+                    episode_return=float(self._episode_return[env_id].item()),
+                    episode_length=episode_length,
+                    final_orientation_error=float(
+                        self.unwrapped.last_done_orientation_error[env_id].item()
+                    ),
+                    mean_action_norm=float(mean_action.item()),
+                    max_action_norm=float(self._action_norm_max[env_id].item()),
                 )
-                self.logger.write(record)
-                self._recent_records.append(record)
+                self.logger.write(rec)
+                self._recent_records.append(rec)
                 self._episode_counter += 1
 
-                completed_returns.append(record.episode_return)
-                completed_lengths.append(float(record.episode_length))
-                completed_success.append(1.0 if reason == TERMINATION_SUCCESS else 0.0)
+            self._episode_return[done_ids] = 0.0
+            self._episode_length[done_ids] = 0
+            self._action_norm_sum[done_ids] = 0.0
+            self._action_norm_max[done_ids] = 0.0
 
-                if reason == TERMINATION_TIMEOUT:
-                    self._timeouts[i] = 1.0
+        return obs, rewards, dones, extras
 
-                obs_reset, _ = env.reset()
-                self.obs_buf[i] = obs_reset
-                self.episode_length_buf[i] = 0
 
-        extras: dict = {"time_outs": self._timeouts.clone()}
-        if completed_returns:
-            extras["log"] = {
-                "/episode_return": torch.tensor(completed_returns, dtype=torch.float32).mean(),
-                "/episode_length": torch.tensor(completed_lengths, dtype=torch.float32).mean(),
-                "/success_rate": torch.tensor(completed_success, dtype=torch.float32).mean(),
+class ReorientEnv:
+    """Single-env numpy API adapter for debugging and contract checks."""
+
+    def __init__(
+        self,
+        robot_cfg: RobotCfg,
+        task_cfg: ReorientTaskCfg,
+        seed: int,
+        device: str,
+        debug: bool = False,
+    ) -> None:
+        cfg = build_reorient_mjlab_cfg(
+            robot_cfg=robot_cfg, task_cfg=task_cfg, num_envs=1, seed=seed
+        )
+        self._env = ReorientMjlabEnv(
+            cfg=cfg,
+            robot_cfg=robot_cfg,
+            task_cfg=task_cfg,
+            device=device,
+            debug=debug,
+        )
+        self._ep_return = 0.0
+        self._ep_length = 0
+        self._act_norm_sum = 0.0
+        self._act_norm_max = 0.0
+
+    @property
+    def action_dim(self) -> int:
+        return int(self._env.action_manager.total_action_dim)
+
+    @property
+    def observation_dim(self) -> int:
+        obs, _ = self._env.reset()
+        policy = obs["policy"]
+        return int(policy.shape[-1])
+
+    def reset(self):
+        obs, _ = self._env.reset()
+        self._ep_return = 0.0
+        self._ep_length = 0
+        self._act_norm_sum = 0.0
+        self._act_norm_max = 0.0
+
+        policy = obs["policy"][0].detach().cpu().numpy().astype(np.float32)
+        info = {"target_quat": self._env.target_quat[0].detach().cpu().numpy().copy()}
+        return policy, info
+
+    def step(self, action: np.ndarray):
+        action_t = torch.as_tensor(action, dtype=torch.float32, device=self._env.device).reshape(
+            1, -1
+        )
+        obs, rew, terminated, truncated, extras = self._env.step(action_t)
+
+        reward = float(rew[0].item())
+        self._ep_return += reward
+        self._ep_length += 1
+
+        act_norm = float(torch.linalg.norm(action_t[0]).item())
+        self._act_norm_sum += act_norm
+        self._act_norm_max = max(self._act_norm_max, act_norm)
+
+        done = bool(terminated[0].item() or truncated[0].item())
+        info: dict = {}
+
+        if done:
+            if bool(truncated[0].item()):
+                reason = TERMINATION_TIMEOUT
+            elif bool(self._env.last_done_nan[0].item()):
+                reason = TERMINATION_NAN
+            elif bool(self._env.last_done_success[0].item()):
+                reason = TERMINATION_SUCCESS
+            elif bool(self._env.last_done_drop[0].item()):
+                reason = TERMINATION_DROP
+            elif bool(self._env.last_done_oob[0].item()):
+                reason = TERMINATION_OOB
+            else:
+                reason = TERMINATION_NAN
+
+            info = {
+                "termination_reason": reason,
+                "episode_return": float(self._ep_return),
+                "episode_length": int(self._ep_length),
+                "final_orientation_error": float(self._env.last_done_orientation_error[0].item()),
+                "mean_action_norm": float(self._act_norm_sum / max(self._ep_length, 1)),
+                "max_action_norm": float(self._act_norm_max),
             }
 
-        return self._tensor_obs(), self.rew_buf.clone(), self.done_buf.clone(), extras
+        policy = obs["policy"][0].detach().cpu().numpy().astype(np.float32)
+        return policy, reward, bool(terminated[0].item()), bool(truncated[0].item()), info
 
     def close(self) -> None:
-        for env in self.envs:
-            env.close()
+        self._env.close()
+
+
+__all__ = [
+    "TERMINATION_SUCCESS",
+    "TERMINATION_DROP",
+    "TERMINATION_OOB",
+    "TERMINATION_TIMEOUT",
+    "TERMINATION_NAN",
+    "ReorientEnv",
+    "ReorientVecEnv",
+    "ReorientMjlabEnv",
+    "build_reorient_mjlab_cfg",
+]
