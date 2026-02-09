@@ -1,0 +1,81 @@
+<mujoco model="dexplay_xhand_phase0">
+  <compiler angle="radian"/>
+  <option timestep="0.0025" integrator="RK4" gravity="0 0 -1.5" iterations="30" ls_iterations="20"/>
+  <size njmax="1500" nconmax="1500"/>
+
+  <default>
+    <joint damping="0.05" armature="0.004" limited="true"/>
+    <geom condim="6" friction="1.0 0.05 0.002"/>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 1.2"/>
+    <geom name="table" type="plane" size="1 1 0.1" rgba="0.86 0.86 0.86 1"/>
+
+    <body name="palm" pos="0 0 0.09">
+      <geom name="palm_geom" type="box" size="0.044 0.048 0.012" rgba="0.16 0.20 0.24 1" mass="0.23"/>
+      <site name="palm_center" pos="0 0 0.014" size="0.004" rgba="0 1 0 1"/>
+
+      <body name="x_thumb_base" pos="-0.020 -0.030 0.008">
+        <joint name="x_thumb_0" type="hinge" axis="0 0 1" range="-0.35 0.90"/>
+        <geom type="capsule" fromto="0 0 0 0.022 0 0" size="0.008" rgba="0.78 0.60 0.44 1" mass="0.030"/>
+        <body pos="0.022 0 0">
+          <joint name="x_thumb_1" type="hinge" axis="0 1 0" range="-0.30 1.40"/>
+          <geom type="capsule" fromto="0 0 0 0.023 0 0" size="0.007" rgba="0.78 0.60 0.44 1" mass="0.020"/>
+          <body pos="0.023 0 0">
+            <joint name="x_thumb_2" type="hinge" axis="0 1 0" range="-0.20 1.35"/>
+            <geom type="capsule" fromto="0 0 0 0.020 0 0" size="0.0063" rgba="0.78 0.60 0.44 1" mass="0.014"/>
+          </body>
+        </body>
+      </body>
+
+      <body name="x_index_base" pos="0.015 -0.026 0.010">
+        <joint name="x_index_0" type="hinge" axis="0 0 1" range="-0.35 0.55"/>
+        <geom type="capsule" fromto="0 0 0 0.029 0 0" size="0.0075" rgba="0.72 0.58 0.43 1" mass="0.025"/>
+        <body pos="0.029 0 0">
+          <joint name="x_index_1" type="hinge" axis="0 1 0" range="-0.25 1.35"/>
+          <geom type="capsule" fromto="0 0 0 0.023 0 0" size="0.0068" rgba="0.72 0.58 0.43 1" mass="0.018"/>
+          <body pos="0.023 0 0">
+            <joint name="x_index_2" type="hinge" axis="0 1 0" range="-0.25 1.35"/>
+            <geom type="capsule" fromto="0 0 0 0.020 0 0" size="0.0062" rgba="0.72 0.58 0.43 1" mass="0.013"/>
+          </body>
+        </body>
+      </body>
+
+      <body name="x_middle_base" pos="0.015 0.000 0.010">
+        <joint name="x_middle_0" type="hinge" axis="0 0 1" range="-0.35 0.55"/>
+        <geom type="capsule" fromto="0 0 0 0.030 0 0" size="0.0075" rgba="0.70 0.58 0.43 1" mass="0.025"/>
+        <body pos="0.030 0 0">
+          <joint name="x_middle_1" type="hinge" axis="0 1 0" range="-0.25 1.35"/>
+          <geom type="capsule" fromto="0 0 0 0.024 0 0" size="0.0068" rgba="0.70 0.58 0.43 1" mass="0.018"/>
+          <body pos="0.024 0 0">
+            <joint name="x_middle_2" type="hinge" axis="0 1 0" range="-0.25 1.35"/>
+            <geom type="capsule" fromto="0 0 0 0.021 0 0" size="0.0062" rgba="0.70 0.58 0.43 1" mass="0.013"/>
+          </body>
+        </body>
+      </body>
+
+      <body name="x_ring_base" pos="0.015 0.026 0.010">
+        <joint name="x_ring_0" type="hinge" axis="0 0 1" range="-0.35 0.55"/>
+        <geom type="capsule" fromto="0 0 0 0.028 0 0" size="0.0072" rgba="0.68 0.57 0.42 1" mass="0.023"/>
+        <body pos="0.028 0 0">
+          <joint name="x_ring_1" type="hinge" axis="0 1 0" range="-0.25 1.35"/>
+          <geom type="capsule" fromto="0 0 0 0.022 0 0" size="0.0065" rgba="0.68 0.57 0.42 1" mass="0.017"/>
+          <body pos="0.022 0 0">
+            <joint name="x_ring_2" type="hinge" axis="0 1 0" range="-0.25 1.35"/>
+            <geom type="capsule" fromto="0 0 0 0.019 0 0" size="0.0060" rgba="0.68 0.57 0.42 1" mass="0.012"/>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <body name="cube" pos="0.0 0.0 0.125">
+      <freejoint name="cube_free"/>
+      <geom name="cube_geom" type="box" size="0.015 0.015 0.015" mass="0.032" rgba="0.22 0.50 0.86 1"/>
+    </body>
+  </worldbody>
+
+  <keyframe>
+    <key name="default" qpos="0.30 0.70 0.65 0.08 0.62 0.58 0.10 0.65 0.60 0.12 0.68 0.60 0 0 0.125 1 0 0 0"/>
+  </keyframe>
+</mujoco>

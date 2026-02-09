@@ -1,0 +1,25 @@
+# Runtime outputs
+runs/
+
+# Pixi
+.pixi/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.so
+.ruff_cache/
+
+# Checkpoints / model weights
+*.pt
+*.pth
+*.ckpt
+
+# MuJoCo / mjlab caches
+*.mjb
+mjmodel_cache/
+.mujoco/
+.warp/
+
+# Misc
+.DS_Store

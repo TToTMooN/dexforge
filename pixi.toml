@@ -1,0 +1,23 @@
+[project]
+name = "dexplay-phase0"
+version = "0.1.0"
+channels = ["conda-forge"]
+platforms = ["linux-64", "linux-aarch64", "osx-arm64"]
+
+[dependencies]
+python = ">=3.11,<3.12"
+numpy = ">=1.26"
+ruff = ">=0.6"
+
+[pypi-dependencies]
+dexplay = { path = ".", editable = true }
+mujoco = ">=3.2.6"
+rsl-rl-lib = ">=3.1.2,<4"
+
+[tasks]
+train_allegro = "python -m dexplay.rl.train_ppo --robot allegro --run_name demo_allegro --total_timesteps 200000 --device cuda"
+train_xhand = "python -m dexplay.rl.train_ppo --robot xhand --run_name demo_xhand --total_timesteps 200000 --device cuda"
+eval_allegro = "python -m dexplay.rl.eval --robot allegro --run_name demo_allegro --checkpoint_path runs/demo_allegro/checkpoints/latest.pt --episodes 50 --seed 0"
+eval_xhand = "python -m dexplay.rl.eval --robot xhand --run_name demo_xhand --checkpoint_path runs/demo_xhand/checkpoints/latest.pt --episodes 50 --seed 0"
+fmt = "ruff format src"
+lint = "ruff check src"

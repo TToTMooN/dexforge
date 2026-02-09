@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dexplay"
+version = "0.1.0"
+description = "Phase-0 dexterous RL playground using rsl_rl with a MuJoCo fallback backend"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "dexplay" }]
+license = { text = "MIT" }
+dependencies = []
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
